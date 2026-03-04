@@ -1,0 +1,14 @@
+av==16.1.0
+datasets==4.5.0
+decord==0.6.0
+huggingface_hub==0.36.2
+logzero==1.7.0
+matplotlib==3.10.8
+numpy==1.26.1
+tokenizers==0.20.3
+torch==2.1.2
+torchvision==0.16.2
+tqdm==4.67.3
+transformers==4.45.0
+-e git+https://github.com/LLaVA-VL/LLaVA-NeXT@e9835311c6f515a13702eb7a7750fcd936f65ed8#egg=llava
+
