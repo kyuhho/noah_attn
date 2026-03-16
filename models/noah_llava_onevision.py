@@ -22,9 +22,9 @@ warnings.filterwarnings("ignore")
 DEFAULT_CONFIG = {
     "event_similarity_threshold": 0.94,
     "cross_event_bias_value": -3.0,
-    "cross_event_layers": [0, 15],
-    "vision_focus_boost": 5.0,
-    "vision_focus_layers": [8, 23],
+    "cross_event_layers": [0, 12],
+    "vision_focus_boost": 1.0,
+    "vision_focus_layers": [7, 20],
 }
 
 DEFAULT_QUESTION = "What happens in this video? Please describe it in detail."
@@ -53,6 +53,9 @@ class NoahLLaVAOneVision:
         self._event_bias_value: float = 0.0
         self._cross_event_layers: set[int] = set()
         self._features: set[str] = set()
+        self._vision_focus_layers: set[int] = set()
+        self._vision_focus_boost: float = 0.0
+        self._dominant_event_idx: int | None = None
 
         self._load_model()
 
@@ -135,6 +138,24 @@ class NoahLLaVAOneVision:
                 attn_weights = attn_weights + causal_mask
 
             # ------------------------------------------------------------------
+            # Init: compute token_per_frame / visual_token_len once during prefill
+            # ------------------------------------------------------------------
+            if q_len > 1 and self._token_info is not None:
+                info = self._token_info
+                if info.get("token_per_frame") is None and info["num_frames"] > 0:
+                    vis_len = q_len - (info["original_ids_len"] - 1)
+                    _merge = getattr(self.model.config, "mm_patch_merge_type", "")
+                    _newline = getattr(self.model.config, "mm_newline_position", "")
+                    _global = 1 if (_newline == "one_token" and "unpad" in _merge and vis_len > 0) else 0
+                    effective = max(0, vis_len - _global)
+                    if effective >= info["num_frames"]:
+                        tpf = effective // info["num_frames"]
+                        info["token_per_frame"] = tpf
+                        info["visual_token_len"] = tpf * info["num_frames"]
+                        logger.debug(f"[INIT] tpf={tpf}, effective={effective}, "
+                                     f"vis_len={vis_len}, _global={_global}")
+
+            # ------------------------------------------------------------------
             # Cross-event attention bias (prefill only, q_len > 1)
             # ------------------------------------------------------------------
             if (
@@ -148,13 +169,6 @@ class NoahLLaVAOneVision:
                     kv_len = key_states.shape[-2]
 
                     if info and events and len(events) > 1 and bias_value != 0:
-                        # Lazily infer token_per_frame / visual_token_len from current sequence
-                        if info.get("token_per_frame") is None:
-                            vis_len = q_len - (info["original_ids_len"] - 1)
-                            if info["num_frames"] > 0:
-                                info["token_per_frame"] = vis_len // info["num_frames"]
-                                info["visual_token_len"] = vis_len
-
                         vid_start = info["video_index"]
                         tpf = info.get("token_per_frame")
                         num_frames = info.get("num_frames")
@@ -213,6 +227,68 @@ class NoahLLaVAOneVision:
 
                             attn_weights = attn_weights + bias
 
+            # ------------------------------------------------------------------
+            # Vision focus (decode only): probe attention → pick event with most attention → boost its frames
+            # ------------------------------------------------------------------
+            if (
+                ("vision_focus_greedy" in self._features or "vision_focus_dominant" in self._features)
+                and q_len == 1
+                and hasattr(self, "_vision_focus_layers")
+                and layer_idx in self._vision_focus_layers
+            ):
+                info = self._token_info
+                events = self._events
+                kv_len = key_states.shape[-2]
+                if info is not None and events:
+                    vid_start = info["video_index"]
+                    num_frames = info["num_frames"]
+                    if num_frames and vid_start < kv_len:
+                        first_vf_layer = min(self._vision_focus_layers)
+                        use_dominant = "vision_focus_dominant" in self._features
+
+                        tpf = info.get("token_per_frame")
+                        visual_token_len = info.get("visual_token_len")
+
+                        if use_dominant and layer_idx != first_vf_layer:
+                            best_idx = self._dominant_event_idx
+                        elif not tpf or not visual_token_len or vid_start + visual_token_len > kv_len:
+                            best_idx = -1
+                        else:
+                            if use_dominant and layer_idx == first_vf_layer:
+                                self._dominant_event_idx = None
+
+                            probe = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
+                            vis_attn = probe[0, :, 0, vid_start : vid_start + visual_token_len].mean(dim=0)
+                            if vis_attn.numel() != num_frames * tpf:
+                                best_idx = -1
+                            else:
+                                per_frame = vis_attn.view(num_frames, tpf).sum(dim=1).detach().cpu()
+
+                                best_idx, best_avg = -1, -1.0
+                                for ei, ev in enumerate(events):
+                                    valid = [f for f in ev if 1 <= f <= num_frames]
+                                    if not valid:
+                                        continue
+                                    avg = sum(per_frame[f - 1].item() for f in valid) / len(valid)
+                                    if avg > best_avg:
+                                        best_avg = avg
+                                        best_idx = ei
+
+                                if use_dominant and layer_idx == first_vf_layer and best_idx >= 0:
+                                    self._dominant_event_idx = best_idx
+                        
+                        if best_idx is not None and best_idx >= 0:
+                            boost = self._vision_focus_boost
+                            for f in events[best_idx]:
+                                if f < 1 or f > num_frames:
+                                    continue
+                                fs = vid_start + (f - 1) * info.get("token_per_frame", 0)
+                                fe = vid_start + f * info.get("token_per_frame", 0)
+                                fs = max(0, min(fs, kv_len))
+                                fe = max(fs, min(fe, kv_len))
+                                if fs < fe:
+                                    attn_weights[:, :, :, fs:fe] = attn_weights[:, :, :, fs:fe] + boost
+
             # Upcast attention to fp32 (same as Qwen2Attention)
             attn_weights = F.softmax(
                 attn_weights, dim=-1, dtype=torch.float32
@@ -260,6 +336,9 @@ class NoahLLaVAOneVision:
         self._event_bias_value = 0.0
         self._cross_event_layers = set()
         self._features = set()
+        self._vision_focus_layers = set()
+        self._vision_focus_boost = 0.0
+        self._dominant_event_idx = None
 
     def load_video(self, video_path):
         if type(video_path) == str:
@@ -281,7 +360,8 @@ class NoahLLaVAOneVision:
         """
         with torch.inference_mode():
             encoded = self.model.encode_images(video_tensor)
-            pooled = self.model.get_2dPool(encoded)
+            stride = getattr(self.model.config, "mm_spatial_pool_stride", 2)
+            pooled = self.model.get_2dPool(encoded, stride)
             frame_embeds = pooled.mean(dim=1)
         return frame_embeds
 
@@ -325,6 +405,8 @@ class NoahLLaVAOneVision:
         event_similarity_threshold=DEFAULT_CONFIG["event_similarity_threshold"],
         event_bias_value: float = DEFAULT_CONFIG["cross_event_bias_value"],
         cross_event_layers: list | None = None,
+        vision_focus_layers: list | None = None,
+        vision_focus_boost: float = DEFAULT_CONFIG["vision_focus_boost"],
         features: list | None = None,
         save_result=False,
     ):
@@ -362,7 +444,7 @@ class NoahLLaVAOneVision:
             .unsqueeze(0)
             .cuda()
         )
-
+        logger.debug(f"[Input IDs] {input_ids}")
         token_info = {
             "video_index": torch.where(input_ids == IMAGE_TOKEN_INDEX)[-1][0].item(),
             "original_ids_len": input_ids.shape[1],
@@ -370,18 +452,26 @@ class NoahLLaVAOneVision:
             "token_per_frame": None,
             "visual_token_len": None,
         }
+        logger.debug(f"[Token Info] {token_info}")
 
         ce_range = range(0)
         if "cross_event" in feature_set or "cross_event_boundary" in feature_set:
             cfg = cross_event_layers or DEFAULT_CONFIG["cross_event_layers"]
             ce_range = self._range_from_cfg(cfg)
 
-        layers_range = sorted(set(ce_range))
+        vf_range = range(0)
+        if "vision_focus_greedy" in feature_set or "vision_focus_dominant" in feature_set:
+            cfg_vf = vision_focus_layers or DEFAULT_CONFIG["vision_focus_layers"]
+            vf_range = self._range_from_cfg(cfg_vf)
+
+        layers_range = sorted(set(ce_range) | set(vf_range))
         if layers_range:
             self.install_patches(layers=layers_range)
 
         # Save state for patched forwards
         self._cross_event_layers = set(ce_range)
+        self._vision_focus_layers = set(vf_range)
+        self._vision_focus_boost = vision_focus_boost
         self._token_info = token_info
         self._events = events
         self._event_bias_value = event_bias_value
@@ -434,8 +524,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--features",
         nargs="+",
-        choices=["cross_event", "cross_event_boundary"],
-        default=["cross_event_boundary"],
+        choices=["cross_event", "cross_event_boundary", "vision_focus_greedy", "vision_focus_dominant"],
+        default=[
+            # "vision_focus_greedy",
+            # "cross_event_boundary"
+        ],
     )
 
     args = parser.parse_args()
@@ -444,7 +537,7 @@ if __name__ == "__main__":
         model_path="/home/work/Redteaming/data1/noah/llava-onevision-qwen2-7b-ov",
         model_base=None,
         vision_tower_path="/home/work/Redteaming/data1/noah/siglip-so400m-patch14-384",
-        for_get_frames_num=8,
+        for_get_frames_num=16,
     )
 
     result = manipulator.run_inference(
@@ -454,6 +547,8 @@ if __name__ == "__main__":
         event_similarity_threshold=DEFAULT_CONFIG["event_similarity_threshold"],
         event_bias_value=DEFAULT_CONFIG["cross_event_bias_value"],
         cross_event_layers=DEFAULT_CONFIG["cross_event_layers"],
+        vision_focus_layers=DEFAULT_CONFIG["vision_focus_layers"],
+        vision_focus_boost=DEFAULT_CONFIG["vision_focus_boost"],
         features=args.features,
     )
     print(result["answer"])
