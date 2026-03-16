@@ -45,7 +45,7 @@ class NoahLLaVANeXTVideo:
         mm_newline_position="no_token",
         force_sample=False,
         add_time_instruction=False,
-        output_dir="/output",
+        output_dir="/home/work/Redteaming/kyuho/noah/output",
     ):
         self.model_path = model_path
         self.model_base = model_base
@@ -67,7 +67,7 @@ class NoahLLaVANeXTVideo:
         self._event_bias_value: float = 0.0
         self._vision_focus_boost: float = 0.0
         self._features: set = set()
-        self._dominant_event_idx: int | None = None
+        self._dominant_event_idx: int | None = None  # vision_focus_dominant: first layer sets, rest use
 
         os.makedirs(self.output_dir, exist_ok=True)
         self._load_model()
@@ -355,6 +355,7 @@ class NoahLLaVANeXTVideo:
                                         best_idx = ei
                             if use_dominant and layer_idx == first_vf_layer and best_idx >= 0:
                                 self._dominant_event_idx = best_idx
+
                         if best_idx is not None and best_idx >= 0:
                             boost = self._vision_focus_boost
                             for f in events[best_idx]:
@@ -379,6 +380,7 @@ class NoahLLaVANeXTVideo:
         return forward
 
     def install_patches(self, layers: range | None = None):
+        """Replace attention forward"""
         self.remove_patches()
         num_layers = len(self.model.model.layers)
         if layers is None:
@@ -391,6 +393,7 @@ class NoahLLaVANeXTVideo:
         logger.info(f"Forward patch on layers {list(layers)}.")
 
     def remove_patches(self):
+        """Restore original attention forwards."""
         for i, orig_fwd in self._patched_forwards.items():
             self.model.model.layers[i].self_attn.forward = orig_fwd
         if self._patched_forwards:
@@ -399,11 +402,17 @@ class NoahLLaVANeXTVideo:
         self._token_info = None
         self._events = []
         self._event_bias_value = 0.0
+        self._cross_event_layers = set()
+        self._vision_focus_layers = set()
         self._vision_focus_boost = 0.0
         self._features = set()
         self._dominant_event_idx = None
 
     def _get_frame_embeddings(self, video_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Encode video frames with the same pipeline as LLaVA (vision_tower + projector + get_2dPool with stride=2),
+        then return one embedding per frame: (num_frames, hidden_size).
+        """
         with torch.inference_mode():
             encoded = self.model.encode_images(video_tensor)
             pooled = self.model.get_2dPool(encoded)
@@ -413,6 +422,10 @@ class NoahLLaVANeXTVideo:
     def _compute_event_boundaries(
         self, frame_embeds: torch.Tensor, threshold: float = 0.5
     ) -> list[list[int]]:
+        """
+        Consecutive cosine similarity; where sim[i] < threshold, put a boundary between frame i and i+1.
+        Returns list of events, each event = list of 1-indexed frame numbers.
+        """
         if frame_embeds.shape[0] <= 1:
             return [[i for i in range(1, frame_embeds.shape[0] + 1)]]
         a = frame_embeds[:-1]
@@ -551,30 +564,32 @@ class NoahLLaVANeXTVideo:
         self._vision_focus_boost = vision_focus_boost
         self._features = set(features or [])
 
-        with torch.inference_mode():
-            _name = (
-                getattr(self.cfg_pretrained, "_name_or_path", "")
-                or self.model_path
-            )
-            is_mistral = "mistral" in _name.lower()
-            generate_kwargs = {
-                "inputs": input_ids,
-                "images": video,
-                "attention_mask": attention_masks,
-                "modalities": "video",
-                "do_sample": False,
-                "temperature": 0.0,
-                "max_new_tokens": 1024,
-                "top_p": 0.1,
-                "num_beams": 1,
-                "use_cache": True,
-            }
-            if not is_mistral:
-                generate_kwargs["stopping_criteria"] = [stopping_criteria]
+        try:
+            with torch.inference_mode():
+                _name = (
+                    getattr(self.cfg_pretrained, "_name_or_path", "")
+                    or self.model_path
+                )
+                is_mistral = "mistral" in _name.lower()
+                generate_kwargs = {
+                    "inputs": input_ids,
+                    "images": video,
+                    "attention_mask": attention_masks,
+                    "modalities": "video",
+                    "do_sample": False,
+                    "temperature": 0.0,
+                    "max_new_tokens": 1024,
+                    "top_p": 0.1,
+                    "num_beams": 1,
+                    "use_cache": True,
+                }
+                if not is_mistral:
+                    generate_kwargs["stopping_criteria"] = [stopping_criteria]
 
-            output = self.model.generate(**generate_kwargs)
-
-        self.remove_patches()
+                output = self.model.generate(**generate_kwargs)
+        finally:
+            if layers_range:
+                self.remove_patches()
 
         generated_text = self.tokenizer.batch_decode(
             output, skip_special_tokens=True
@@ -603,16 +618,17 @@ class NoahLLaVANeXTVideo:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--video_path", type=str, default="/path/to/video.mp4")
+    parser.add_argument("--video_path", type=str, default="/home/work/Redteaming/kyuho/noah/dataset/noah/--mFXNrRZ5E_GgfyTMpHfnI_2_low_center.mp4")
     parser.add_argument("--video_id", type=str, default="result")
     parser.add_argument("--question", type=str, default=DEFAULT_QUESTION)
-    parser.add_argument("--features", nargs="+", choices=["cross_event", "cross_event_boundary", "vision_focus_greedy", "vision_focus_dominant"], default=["cross_event_boundary"])
+    parser.add_argument("--features", nargs="+", choices=["cross_event", "cross_event_boundary", "vision_focus_greedy", "vision_focus_dominant"], default=["vision_focus_greedy"])
 
     args = parser.parse_args()
 
     manipulator = NoahLLaVANeXTVideo(
-        model_path="lmms-lab/LLaVA-NeXT-Video-7B",
+        model_path="/home/work/Redteaming/data1/noah/LLaVA-NeXT-Video-7B",
         model_base=None,
+        vision_tower_path="/home/work/Redteaming/data1/noah/clip-vit-large-patch14-336",
         conv_mode="vicuna_v1",
         mm_spatial_pool_stride=4,
         mm_spatial_pool_mode="average",
@@ -631,5 +647,4 @@ if __name__ == "__main__":
         features=args.features,
         vision_focus_boost=DEFAULT_CONFIG["vision_focus_boost"],
     )
-
 
