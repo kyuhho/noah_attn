@@ -24,8 +24,13 @@ DEFAULT_CONFIG = {
     "event_similarity_threshold": 0.94,
     "cross_event_bias_value": -7.0,
     "cross_event_layers": [0, 15],
-    "vision_focus_boost": 0.0,
-    "vision_focus_layers": [0, 31],
+    "vision_focus_boost": 1.0,
+    "vision_focus_layers": [[0, 7], [24, 31]],
+    "vision_focus_sparse_threshold": 0.3,
+    "vision_focus_confident_threshold": 0.4,
+    "vision_knockout_layers": [28, 31],
+    "text_suppress_bias": 0.1,
+    "text_suppress_layers": [0, 15],
 }
 
 DEFAULT_QUESTION = "What happens in this video? Please describe it in detail."
@@ -68,6 +73,11 @@ class NoahLLaVANeXTVideo:
         self._vision_focus_boost: float = 0.0
         self._features: set = set()
         self._dominant_event_idx: int | None = None  # vision_focus_dominant: first layer sets, rest use
+        self._vision_focus_sparse_threshold: float = 0.0
+        self._vision_focus_confident_threshold: float = 0.0
+        self._vision_knockout_layers: set[int] = set()
+        self._text_suppress_layers: set[int] = set()
+        self._text_suppress_bias: float = 0.0
 
         os.makedirs(self.output_dir, exist_ok=True)
         self._load_model()
@@ -219,13 +229,29 @@ class NoahLLaVANeXTVideo:
                         causal_mask = attention_mask[:, :, cache_position, : key_states.shape[-2]]
                 attn_weights = attn_weights + causal_mask
 
-            # Prefill: set token_per_frame / visual_token_len when vision_focus_greedy or vision_focus_dominant is on
-            if (
-                q_len > 1
-                and ("vision_focus_greedy" in self._features or "vision_focus_dominant" in self._features)
+            # Prefill: set token_per_frame / visual_token_len for vision_focus or vision_knockout
+            vf_prefill = (
+                (
+                    "vision_focus_greedy" in self._features
+                    or "vision_focus_dominant" in self._features
+                    or "vision_focus_sparse" in self._features
+                    or "vision_focus_confident" in self._features
+                    or "vision_focus_all" in self._features
+                )
                 and hasattr(self, "_vision_focus_layers")
                 and layer_idx in self._vision_focus_layers
-            ):
+            )
+            vk_prefill = (
+                "vision_knockout" in self._features
+                and hasattr(self, "_vision_knockout_layers")
+                and layer_idx in self._vision_knockout_layers
+            )
+            ts_prefill = (
+                "text_suppress" in self._features
+                and hasattr(self, "_text_suppress_layers")
+                and layer_idx in self._text_suppress_layers
+            )
+            if q_len > 1 and (vf_prefill or vk_prefill or ts_prefill):
                 info = self._token_info
                 if info is not None and info.get("token_per_frame") is None:
                     vis_len = q_len - (info["original_ids_len"] - 1)
@@ -368,6 +394,173 @@ class NoahLLaVANeXTVideo:
                                 if fs < fe:
                                     attn_weights[:, :, :, fs:fe] = attn_weights[:, :, :, fs:fe] + boost
 
+            # Vision focus all (decode only): boost all visual tokens (no event/frame selection)
+            if (
+                "vision_focus_all" in self._features
+                and q_len == 1
+                and hasattr(self, "_vision_focus_layers")
+                and layer_idx in self._vision_focus_layers
+            ):
+                info = self._token_info
+                kv_len = key_states.shape[-2]
+                if info is not None and info.get("visual_token_len") is not None:
+                    vid_start = info["video_index"]
+                    vis_len = info["visual_token_len"]
+                    fs = max(0, min(vid_start, kv_len))
+                    fe = max(fs, min(vid_start + vis_len, kv_len))
+                    if fs < fe:
+                        attn_weights[:, :, :, fs:fe] = attn_weights[:, :, :, fs:fe] + self._vision_focus_boost
+
+            # Vision focus sparse (decode only): boost best event only when attention is uncertain (small margin)
+            if (
+                "vision_focus_sparse" in self._features
+                and q_len == 1
+                and hasattr(self, "_vision_focus_layers")
+                and layer_idx in self._vision_focus_layers
+            ):
+                info = self._token_info
+                events = self._events
+                kv_len = key_states.shape[-2]
+                if (
+                    info is not None
+                    and info.get("visual_token_len") is not None
+                    and events
+                    and len(events) >= 2
+                ):
+                    vid_start = info["video_index"]
+                    vis_len = info["visual_token_len"]
+                    tpf = info["token_per_frame"]
+                    num_frames = info["num_frames"]
+                    if tpf and num_frames and vid_start + vis_len <= kv_len:
+                        probe = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
+                        vis_attn = probe[0, :, 0, vid_start : vid_start + vis_len].mean(dim=0)
+                        if vis_attn.numel() == num_frames * tpf:
+                            per_frame = vis_attn.view(num_frames, tpf).sum(dim=1).detach().cpu()
+                            event_avgs = []
+                            best_idx, best_avg = -1, -1.0
+                            for ei, ev in enumerate(events):
+                                valid = [f for f in ev if 1 <= f <= num_frames]
+                                if not valid:
+                                    event_avgs.append(0.0)
+                                    continue
+                                avg = sum(per_frame[f - 1].item() for f in valid) / len(valid)
+                                event_avgs.append(avg)
+                                if avg > best_avg:
+                                    best_avg = avg
+                                    best_idx = ei
+                            total = sum(event_avgs)
+                            if total > 0 and best_idx >= 0:
+                                norm_avgs = sorted([a / total for a in event_avgs], reverse=True)
+                                margin = norm_avgs[0] - norm_avgs[1]
+                                if margin < self._vision_focus_sparse_threshold:
+                                    boost = self._vision_focus_boost
+                                    for f in events[best_idx]:
+                                        if f < 1 or f > num_frames:
+                                            continue
+                                        fs = vid_start + (f - 1) * tpf
+                                        fe = vid_start + f * tpf
+                                        fs = max(0, min(fs, kv_len))
+                                        fe = max(fs, min(fe, kv_len))
+                                        if fs < fe:
+                                            attn_weights[:, :, :, fs:fe] = attn_weights[:, :, :, fs:fe] + boost
+
+            # Vision focus confident (decode only): boost best event only when attention is confident (large margin)
+            if (
+                "vision_focus_confident" in self._features
+                and q_len == 1
+                and hasattr(self, "_vision_focus_layers")
+                and layer_idx in self._vision_focus_layers
+            ):
+                info = self._token_info
+                events = self._events
+                kv_len = key_states.shape[-2]
+                if (
+                    info is not None
+                    and info.get("visual_token_len") is not None
+                    and events
+                    and len(events) >= 2
+                ):
+                    vid_start = info["video_index"]
+                    vis_len = info["visual_token_len"]
+                    tpf = info["token_per_frame"]
+                    num_frames = info["num_frames"]
+                    if tpf and num_frames and vid_start + vis_len <= kv_len:
+                        probe = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
+                        vis_attn = probe[0, :, 0, vid_start : vid_start + vis_len].mean(dim=0)
+                        if vis_attn.numel() == num_frames * tpf:
+                            per_frame = vis_attn.view(num_frames, tpf).sum(dim=1).detach().cpu()
+                            event_avgs = []
+                            best_idx, best_avg = -1, -1.0
+                            for ei, ev in enumerate(events):
+                                valid = [f for f in ev if 1 <= f <= num_frames]
+                                if not valid:
+                                    event_avgs.append(0.0)
+                                    continue
+                                avg = sum(per_frame[f - 1].item() for f in valid) / len(valid)
+                                event_avgs.append(avg)
+                                if avg > best_avg:
+                                    best_avg = avg
+                                    best_idx = ei
+                            total = sum(event_avgs)
+                            if total > 0 and best_idx >= 0:
+                                norm_avgs = sorted([a / total for a in event_avgs], reverse=True)
+                                margin = norm_avgs[0] - norm_avgs[1]
+                                if margin >= self._vision_focus_confident_threshold:
+                                    boost = self._vision_focus_boost
+                                    for f in events[best_idx]:
+                                        if f < 1 or f > num_frames:
+                                            continue
+                                        fs = vid_start + (f - 1) * tpf
+                                        fe = vid_start + f * tpf
+                                        fs = max(0, min(fs, kv_len))
+                                        fe = max(fs, min(fe, kv_len))
+                                        if fs < fe:
+                                            attn_weights[:, :, :, fs:fe] = attn_weights[:, :, :, fs:fe] + boost
+
+            # Vision knockout (decode only): block queries from attending to visual key positions
+            if (
+                "vision_knockout" in self._features
+                and q_len == 1
+                and hasattr(self, "_vision_knockout_layers")
+                and layer_idx in self._vision_knockout_layers
+            ):
+                info = self._token_info
+                kv_len = key_states.shape[-2]
+                if info is not None and info.get("visual_token_len") is not None:
+                    vid_start = info["video_index"]
+                    vis_len = info["visual_token_len"]
+                    fs = max(0, min(vid_start, kv_len))
+                    fe = max(fs, min(vid_start + vis_len, kv_len))
+                    if fs < fe:
+                        if attn_weights.dtype in (torch.float16, torch.bfloat16):
+                            neg_large = torch.tensor(
+                                -1e4, device=attn_weights.device, dtype=attn_weights.dtype
+                            )
+                        else:
+                            neg_large = torch.tensor(
+                                -1e9, device=attn_weights.device, dtype=attn_weights.dtype
+                            )
+                        attn_weights[:, :, :, fs:fe] = (
+                            attn_weights[:, :, :, fs:fe] + neg_large
+                        )
+
+            # text_suppress (decode only): suppress attention to previously generated tokens
+            if (
+                "text_suppress" in self._features
+                and q_len == 1
+                and hasattr(self, "_text_suppress_layers")
+                and layer_idx in self._text_suppress_layers
+            ):
+                info = self._token_info
+                kv_len = key_states.shape[-2]
+                if info is not None and info.get("visual_token_len") is not None:
+                    prefill_len = info["original_ids_len"] - 1 + info["visual_token_len"]
+                    gen_end = kv_len - 1
+                    if prefill_len < gen_end:
+                        attn_weights[:, :, :, prefill_len:gen_end] = (
+                            attn_weights[:, :, :, prefill_len:gen_end] - self._text_suppress_bias
+                        )
+
             attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
             attn_weights = F.dropout(attn_weights, p=module.attention_dropout, training=module.training)
             attn_output = torch.matmul(attn_weights, value_states)
@@ -407,6 +600,11 @@ class NoahLLaVANeXTVideo:
         self._vision_focus_boost = 0.0
         self._features = set()
         self._dominant_event_idx = None
+        self._vision_focus_sparse_threshold = 0.0
+        self._vision_focus_confident_threshold = 0.0
+        self._vision_knockout_layers = set()
+        self._text_suppress_layers = set()
+        self._text_suppress_bias = 0.0
 
     def _get_frame_embeddings(self, video_tensor: torch.Tensor) -> torch.Tensor:
         """
@@ -452,6 +650,11 @@ class NoahLLaVANeXTVideo:
         vision_focus_layers: list | None = None,
         features: list | None = None,
         vision_focus_boost: float = 0.5,
+        vision_focus_sparse_threshold: float = 0.3,
+        vision_focus_confident_threshold: float = 0.3,
+        vision_knockout_layers: list | None = None,
+        text_suppress_layers: list | None = None,
+        text_suppress_bias: float = 2.0,
         output_dir: str | None = None,
         save_result: bool = True,
     ) -> dict | None:
@@ -534,34 +737,73 @@ class NoahLLaVANeXTVideo:
 
         num_layers = len(self.model.model.layers)
 
-        def _range_from_cfg(cfg: list | None) -> range:
-            if cfg is None or len(cfg) < 2:
-                return range(num_layers)
-            start, end = cfg[0], cfg[1]
-            return range(max(0, start), min(num_layers, end + 1))
+        def _range_from_cfg(cfg: list | None) -> set[int]:
+            """
+            Layer range config (all endpoints inclusive, clamped to [0, num_layers-1]):
+              None / []          -> all layers
+              [start, end]       -> single interval
+              [[s1,e1]]          -> single interval  (same as [s1,e1])
+              [[s1,e1],[s2,e2]]  -> union of intervals
+            """
+            if not cfg or not isinstance(cfg, list):
+                return set(range(num_layers))
+
+            # Normalize to list-of-pairs: [0,7] -> [[0,7]], [[0,7]] -> [[0,7]]
+            if all(isinstance(x, int) for x in cfg):
+                pairs = [cfg[:2]]
+            elif all(isinstance(x, (list, tuple)) for x in cfg):
+                pairs = cfg
+            else:
+                return set(range(num_layers))
+
+            layers: set[int] = set()
+            for pair in pairs:
+                if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+                    continue
+                a, b = pair[0], pair[1]
+                if not isinstance(a, int) or not isinstance(b, int):
+                    continue
+                s, e = (min(a, b), max(a, b))
+                s = max(0, s)
+                e = min(num_layers - 1, e)
+                if s <= e:
+                    layers.update(range(s, e + 1))
+            return layers if layers else set(range(num_layers))
 
         feature_set = set(features or [])
 
-        ce_range = range(0)
-        vf_range = range(0)
+        ce_range: set[int] = set()
+        vf_range: set[int] = set()
+        vk_range: set[int] = set()
         if "cross_event_boundary" in feature_set or "cross_event" in feature_set:
             ce_range = _range_from_cfg(cross_event_layers)
-        if "vision_focus_greedy" in feature_set or "vision_focus_dominant" in feature_set:
+        if "vision_focus_greedy" in feature_set or "vision_focus_dominant" in feature_set or "vision_focus_sparse" in feature_set or "vision_focus_confident" in feature_set or "vision_focus_all" in feature_set:
             vf_range = _range_from_cfg(vision_focus_layers)
+        if "vision_knockout" in feature_set:
+            vk_range = _range_from_cfg(vision_knockout_layers)
 
-        layers_set = set(ce_range) | set(vf_range)
+        ts_range: set[int] = set()
+        if "text_suppress" in feature_set:
+            ts_range = _range_from_cfg(text_suppress_layers)
+
+        layers_set = ce_range | vf_range | vk_range | ts_range
         if layers_set:
             layers_range = sorted(layers_set)
             self.install_patches(layers=layers_range)
         else:
             layers_range = []
 
-        self._cross_event_layers = set(ce_range)
-        self._vision_focus_layers = set(vf_range)
+        self._cross_event_layers = ce_range
+        self._vision_focus_layers = vf_range
+        self._vision_knockout_layers = vk_range
+        self._text_suppress_layers = ts_range
+        self._text_suppress_bias = text_suppress_bias
         self._token_info = token_info
         self._events = events
         self._event_bias_value = event_bias_value
         self._vision_focus_boost = vision_focus_boost
+        self._vision_focus_sparse_threshold = vision_focus_sparse_threshold
+        self._vision_focus_confident_threshold = vision_focus_confident_threshold
         self._features = set(features or [])
 
         try:
@@ -618,10 +860,27 @@ class NoahLLaVANeXTVideo:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--video_path", type=str, default="/home/work/Redteaming/kyuho/noah/dataset/noah/--mFXNrRZ5E_GgfyTMpHfnI_2_low_center.mp4")
+    parser.add_argument("--video_path", type=str, default="/home/work/Redteaming/kyuho/noah/dataset/noah/zEdAxKm9SLA_j82E082KJSw_2_low_end.mp4")
     parser.add_argument("--video_id", type=str, default="result")
     parser.add_argument("--question", type=str, default=DEFAULT_QUESTION)
-    parser.add_argument("--features", nargs="+", choices=["cross_event", "cross_event_boundary", "vision_focus_greedy", "vision_focus_dominant"], default=["vision_focus_greedy"])
+    parser.add_argument(
+        "--features",
+        nargs="+",
+        choices=[
+            "cross_event",
+            "cross_event_boundary",
+            "vision_focus_greedy",
+            "vision_focus_dominant",
+            "vision_focus_sparse",
+            "vision_focus_confident",
+            "vision_focus_all",
+            "vision_knockout",
+            "text_suppress",
+        ],
+        default=[
+            "vision_focus_greedy"
+        ],
+    )
 
     args = parser.parse_args()
 
@@ -646,5 +905,10 @@ if __name__ == "__main__":
         vision_focus_layers=DEFAULT_CONFIG["vision_focus_layers"],
         features=args.features,
         vision_focus_boost=DEFAULT_CONFIG["vision_focus_boost"],
+        vision_focus_sparse_threshold=DEFAULT_CONFIG["vision_focus_sparse_threshold"],
+        vision_focus_confident_threshold=DEFAULT_CONFIG["vision_focus_confident_threshold"],
+        vision_knockout_layers=DEFAULT_CONFIG["vision_knockout_layers"],
+        text_suppress_layers=DEFAULT_CONFIG["text_suppress_layers"],
+        text_suppress_bias=DEFAULT_CONFIG["text_suppress_bias"],
     )
 
